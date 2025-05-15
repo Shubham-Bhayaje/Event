@@ -4,21 +4,30 @@
 
 > _Add your own screenshots in the `screenshots/` folder and update the image links below as needed._
 
+### Home
+
+![Home](https://github.com/Shubham-Bhayaje/Event/blob/main/UI/Screenshot%202025-05-15%20090923.png)
+
+### Log In
+
+![Log in](https://github.com/Shubham-Bhayaje/Event/blob/main/UI/Screenshot%202025-05-15%20090952.png)
+
+### Create Account
+
+![Create Account](https://github.com/Shubham-Bhayaje/Event/blob/main/UI/Screenshot%202025-05-15%20091019.png)
+
 ### Admin Dashboard
 
-![Admin Dashboard](https://github.com/Shubham-Bhayaje/Event/blob/main/UI/Screenshot%202025-05-15%20090923.png)
+![Admin Dashboard](https://github.com/Shubham-Bhayaje/Event/blob/main/UI/Screenshot%202025-05-15%20091037.png)
 
 ### Event Creation
 
-![Create Event](screenshots/create_event.png)
+![Create Event](https://github.com/Shubham-Bhayaje/Event/blob/main/UI/Screenshot%202025-05-15%20091055.png)
 
 ### Photo Upload
 
-![Photo Upload](screenshots/photo_upload.png)
+![Photo Upload](https://github.com/Shubham-Bhayaje/Event/blob/main/UI/Screenshot%202025-05-15%20091110.png)
 
-### Attendee Face Match
-
-![Face Match](screenshots/face_match.png)
 
 ---
 
