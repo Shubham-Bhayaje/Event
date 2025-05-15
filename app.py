@@ -19,11 +19,17 @@ import face_recognition
 import qrcode
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.utils import secure_filename
-from flask import Flask, render_template, request, redirect, url_for, session, flash, jsonify, send_file, Response
+from flask import Flask, render_template, request, redirect, url_for, session, flash, jsonify, send_file, Response, make_response
+from mongo_adapter import MongoAdapter
 
 # Initialize Flask app
 app = Flask(__name__)
 app.secret_key = os.environ.get('SECRET_KEY', 'dev_secret_key')  # Set a proper secret key in production
+
+# MongoDB Setup
+# Replace with your actual credentials
+MONGO_URI = "mongodb+srv://shubhambhayaje:mc%40-M%403YCfiU%23R5@cluster0.k5srgdn.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0"
+mongo = MongoAdapter(MONGO_URI)
 
 # Base directory for our "database"
 BASE_DIR = os.path.abspath(os.path.dirname(__file__))
@@ -36,8 +42,9 @@ ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg'}
 for directory in [DATA_DIR, EVENTS_DIR]:
     os.makedirs(directory, exist_ok=True)
 
-# Initialize admin accounts if they don't exist
+# Initialize admin accounts if they don't exist - Using MongoDB
 def init_admins():
+    # Keeping file-based version for backward compatibility
     if not os.path.exists(ADMINS_FILE):
         admins_data = {
             'admin': {
@@ -52,8 +59,9 @@ def init_admins():
             json.dump(admins_data, f)
         print("Created default admin account: admin / admin123")
 
-# Initialize the admin accounts
+# Initialize the admin accounts - both file-based and MongoDB
 init_admins()
+mongo.init_admins()  # MongoDB version
 
 # Helper functions
 def allowed_file(filename):
@@ -75,24 +83,49 @@ def get_event_faces_data_path(event_id):
     return os.path.join(get_event_path(event_id), 'faces_data.json')
 
 def load_admins():
-    """Load all admin accounts."""
+    """Load all admin accounts from MongoDB with file fallback."""
+    # Get admins from MongoDB
+    mongo_admins = mongo.load_admins()
+    if mongo_admins:
+        return mongo_admins
+    
+    # Fallback to file-based if MongoDB has no data
     if os.path.exists(ADMINS_FILE):
         with open(ADMINS_FILE, 'r') as f:
             return json.load(f)
     return {}
 
 def save_admins(admins):
-    """Save admin accounts."""
+    """Save admin accounts to MongoDB and file for backward compatibility."""
+    # Save to MongoDB
+    mongo.save_admins(admins)
+    
+    # Helper function to make objects JSON serializable
+    def make_json_serializable(obj):
+        if isinstance(obj, dict):
+            return {k: make_json_serializable(v) for k, v in obj.items()}
+        elif hasattr(obj, '__iter__') and not isinstance(obj, (str, bytes)):
+            return [make_json_serializable(item) for item in obj]
+        elif hasattr(obj, 'isoformat'):  # For datetime objects
+            return obj.isoformat()
+        elif hasattr(obj, '__str__'):  # For ObjectId and other objects
+            return str(obj)
+        else:
+            return obj
+    
+    # Convert data to be JSON serializable
+    serializable_admins = make_json_serializable(admins)
+    
+    # Also save to file for backward compatibility
     with open(ADMINS_FILE, 'w') as f:
-        json.dump(admins, f)
+        json.dump(serializable_admins, f)
 
 def load_events(username=None):
     """
-    Load events from the file system.
+    Load events from MongoDB with file system fallback.
     If username is provided, only load events created by that user.
     Everyone can only see their own events, including admins.
     """
-    events = []
     current_user = session.get('admin_username')
     
     # If no username provided, use current user
@@ -102,7 +135,21 @@ def load_events(username=None):
     # Only show own events for everyone including admins
     if username != current_user:
         return []
-        
+    
+    # Try to load from MongoDB first
+    try:
+        mongo_events = mongo.load_events(username)
+        if mongo_events:
+            # Add id field for compatibility
+            for event in mongo_events:
+                if '_id' in event and 'id' not in event:
+                    event['id'] = event['_id']
+            return mongo_events
+    except Exception as e:
+        print(f"Error loading events from MongoDB: {e}")
+    
+    # Fallback to file system
+    events = []
     if os.path.exists(EVENTS_DIR):
         for event_id in os.listdir(EVENTS_DIR):
             event_path = get_event_path(event_id)
@@ -125,8 +172,17 @@ def load_events(username=None):
     return sorted(events, key=lambda x: x.get('date', ''), reverse=True)
 
 def create_event(name, date, description=""):
-    """Create a new event."""
-    event_id = str(uuid.uuid4())
+    """Create a new event in MongoDB with file system backup."""
+    # Create the event in MongoDB
+    try:
+        creator_username = session.get('admin_username')
+        event_id = mongo.create_event(name, date, description, creator_username)
+    except Exception as e:
+        print(f"Error creating event in MongoDB: {e}")
+        # Fallback to file system if MongoDB fails
+        event_id = str(uuid.uuid4())
+    
+    # Also create directories and files for backward compatibility
     event_path = get_event_path(event_id)
     photos_path = get_event_photos_path(event_id)
     faces_path = get_event_faces_path(event_id)
@@ -157,12 +213,22 @@ def create_event(name, date, description=""):
     return event_id
 
 def delete_event(event_id):
-    """Delete an event and all its data."""
+    """Delete an event and all its data from MongoDB and file system."""
+    # Delete from MongoDB
+    mongo_success = mongo.delete_event(event_id)
+    
+    # Also delete from file system for backward compatibility
+    file_success = False
     event_path = get_event_path(event_id)
     if os.path.exists(event_path):
-        shutil.rmtree(event_path)
-        return True
-    return False
+        try:
+            shutil.rmtree(event_path)
+            file_success = True
+        except Exception as e:
+            print(f"Error deleting event from file system: {e}")
+    
+    # Return true if either deletion succeeded
+    return mongo_success or file_success
 
 def generate_qr_code(event_id, base_url="http://localhost:5000"):
     """Generate a QR code for an event."""
@@ -513,18 +579,32 @@ def new_event():
 
 @app.route('/admin/event/<event_id>')
 def view_event(event_id):
-    """View event details."""
+    """View event details from MongoDB or file system."""
     if not session.get('admin_logged_in'):
         return redirect(url_for('admin_login_page'))
     
-    metadata_path = get_event_metadata_path(event_id)
-    if not os.path.exists(metadata_path):
+    # Try to get event from MongoDB first
+    event_data = None
+    try:
+        event_data = mongo.get_event(event_id)
+    except Exception as e:
+        print(f"Error retrieving event from MongoDB: {e}")
+    
+    # If MongoDB failed, try file system
+    if not event_data:
+        metadata_path = get_event_metadata_path(event_id)
+        if not os.path.exists(metadata_path):
+            flash('Event not found', 'error')
+            return redirect(url_for('admin_dashboard'))
+        
+        # Load event data from file
+        with open(metadata_path, 'r') as f:
+            event_data = json.load(f)
+    
+    # If still no event data, return error
+    if not event_data:
         flash('Event not found', 'error')
         return redirect(url_for('admin_dashboard'))
-    
-    # Check if user has permission to view this event
-    with open(metadata_path, 'r') as f:
-        event_data = json.load(f)
     
     # Only allow the creator to view the event
     current_username = session.get('admin_username')
@@ -533,11 +613,32 @@ def view_event(event_id):
         flash('You do not have permission to view this event', 'error')
         return redirect(url_for('admin_dashboard'))
     
-    # Get photos
-    photos_path = get_event_photos_path(event_id)
+    # Get photos - try MongoDB first
     photos = []
-    if os.path.exists(photos_path):
-        photos = os.listdir(photos_path)
+    try:
+        mongo_photos = mongo.get_photos_for_event(event_id)
+        print(f"MongoDB photos raw: {mongo_photos}")
+        if mongo_photos:
+            # Check what's in the photos before processing
+            for photo in mongo_photos:
+                print(f"Photo fields: {photo.keys()}")
+                if 'filename' in photo:
+                    photos.append(photo['filename'])
+                else:
+                    # Try alternative field names
+                    if 'metadata' in photo and 'filename' in photo['metadata']:
+                        photos.append(photo['metadata']['filename'])
+                    else:
+                        print(f"Warning: Photo missing filename field: {photo}")
+            print(f"Final photo list: {photos}")
+    except Exception as e:
+        print(f"Error retrieving photos from MongoDB: {e}")
+    
+    # If MongoDB failed or has no photos, try file system
+    if not photos:
+        photos_path = get_event_photos_path(event_id)
+        if os.path.exists(photos_path):
+            photos = os.listdir(photos_path)
     
     # Generate QR code
     try:
@@ -553,6 +654,7 @@ def view_event(event_id):
 @app.route('/admin/event/<event_id>/upload', methods=['POST'])
 def upload_photos(event_id):
     """Upload photos to an event."""
+    print(f"Starting upload for event: {event_id}")
     if not session.get('admin_logged_in'):
         if request.headers.get('X-Requested-With') == 'XMLHttpRequest':
             return jsonify({'success': False, 'message': 'Not logged in'}), 401
@@ -571,40 +673,111 @@ def upload_photos(event_id):
         event_data = json.load(f)
     
     current_username = session.get('admin_username')
+    print(f"Current username: {current_username}, Event creator: {event_data.get('created_by')}")
     
     if event_data.get('created_by') != current_username:
+        print("ERROR: Permission denied - user does not own this event")
         if request.headers.get('X-Requested-With') == 'XMLHttpRequest':
             return jsonify({'success': False, 'message': 'Permission denied'}), 403
         flash('You do not have permission to upload photos to this event', 'error')
         return redirect(url_for('admin_dashboard'))
     
+    print(f"=================== UPLOAD DEBUG ===================")
+    print(f"Request form: {request.form}")
+    print(f"Request files: {request.files}")
+    print(f"Request files keys: {list(request.files.keys())}")
+    
     if 'photos' not in request.files:
+        print("ERROR: 'photos' not in request.files")
         if request.headers.get('X-Requested-With') == 'XMLHttpRequest':
             return jsonify({'success': False, 'message': 'No files uploaded'}), 400
         flash('No file part', 'error')
         return redirect(url_for('view_event', event_id=event_id))
     
     files = request.files.getlist('photos')
-    if not files or files[0].filename == '':
+    print(f"Files list length: {len(files)}")
+    if not files:
+        print("ERROR: No files found in request")
+        if request.headers.get('X-Requested-With') == 'XMLHttpRequest':
+            return jsonify({'success': False, 'message': 'No selected file'}), 400
+        flash('No selected file', 'error')
+        return redirect(url_for('view_event', event_id=event_id))
+        
+    if files[0].filename == '':
+        print("ERROR: First file has empty filename")
         if request.headers.get('X-Requested-With') == 'XMLHttpRequest':
             return jsonify({'success': False, 'message': 'No selected file'}), 400
         flash('No selected file', 'error')
         return redirect(url_for('view_event', event_id=event_id))
     
+    # Prepare for both MongoDB and file storage
     photos_path = get_event_photos_path(event_id)
     processed_count = 0
     uploaded_filenames = []
     
-    for file in files:
+    print(f"Processing {len(files)} files for upload")
+    
+    for i, file in enumerate(files):
+        print(f"File {i+1}: {file.filename if file else 'None'}")
         if file and allowed_file(file.filename):
             filename = secure_filename(file.filename)
+            print(f"Processing file: {filename}")
+            
+            # Store in MongoDB
+            try:
+                # Read file content
+                file_content = file.read()
+                file.seek(0)  # Reset the file pointer for further processing
+                
+                print(f"Read file content, size: {len(file_content)} bytes")
+                
+                # Save to MongoDB GridFS
+                print(f"Calling save_photo with event_id: {event_id}, filename: {filename}")
+                photo_id = mongo.save_photo(event_id, file_content, filename)
+                print(f"Saved photo to MongoDB with ID: {photo_id}, filename: {filename}")
+                
+                if not photo_id:
+                    print("ERROR: save_photo returned None - photo was not saved to MongoDB")
+                
+                # Process faces with face_recognition
+                print("Loading image for face recognition")
+                image = face_recognition.load_image_file(file)
+                file.seek(0)  # Reset again for file.save()
+                
+                # Find faces
+                print("Finding faces in image")
+                face_locations = face_recognition.face_locations(image)
+                print(f"Found {len(face_locations)} faces in image")
+                
+                if face_locations:
+                    face_encodings = face_recognition.face_encodings(image, face_locations)
+                    
+                    # Save faces to MongoDB
+                    for i, (face_location, face_encoding) in enumerate(zip(face_locations, face_encodings)):
+                        face_id = str(uuid.uuid4())
+                        
+                        # Extract face image
+                        top, right, bottom, left = face_location
+                        face_image = image[top:bottom, left:right]
+                        pil_image = Image.fromarray(face_image)
+                        
+                        # Save to MongoDB
+                        mongo.save_face(event_id, photo_id, face_id, pil_image, face_encoding, face_location)
+                    
+                    processed_count += 1
+            except Exception as e:
+                print(f"MongoDB storage error: {e}")
+                import traceback
+                traceback.print_exc()
+            
+            # Also save to file system for backward compatibility
             file_path = os.path.join(photos_path, filename)
             file.save(file_path)
             uploaded_filenames.append(filename)
             
-            # Process the photo to extract faces
+            # Process for file system as well
             face_ids = process_photo(event_id, file_path)
-            if face_ids:
+            if face_ids and processed_count == 0:  # Only increment if not already counted from MongoDB
                 processed_count += 1
     
     # Set flash messages for non-AJAX responses
@@ -613,33 +786,48 @@ def upload_photos(event_id):
     else:
         flash('Photos uploaded but no faces were detected', 'warning')
     
-    # Return appropriate response based on request type
+    print(f"Upload complete: {len(uploaded_filenames)} files uploaded, {processed_count} processed with faces")
+    print(f"=================== UPLOAD COMPLETE ===================")
+    
+    # Check if the request was AJAX or standard form
     if request.headers.get('X-Requested-With') == 'XMLHttpRequest':
         return jsonify({
             'success': True,
-            'uploaded': len(uploaded_filenames),
-            'processed': processed_count,
-            'message': f'Successfully uploaded {len(uploaded_filenames)} photos, processed {processed_count} with faces'
-        }), 200
-    
-    return redirect(url_for('view_event', event_id=event_id))
+            'message': f'Successfully uploaded {len(uploaded_filenames)} photos.',
+            'processed_count': processed_count,
+            'total_uploaded': len(uploaded_filenames)
+        })
+    else:
+        # Standard form post - redirect to the event page
+        print(f"Redirecting to event page: {event_id}")
+        flash(f'Successfully uploaded {len(uploaded_filenames)} photos.', 'success')
+        return redirect(url_for('view_event', event_id=event_id))
 
 @app.route('/admin/event/<event_id>/delete', methods=['POST'])
 def delete_event_route(event_id):
-    """Delete an event."""
+    """Delete an event from MongoDB and file system."""
     if not session.get('admin_logged_in'):
         return redirect(url_for('admin_login_page'))
     
-    # Check if user has permission to delete this event
-    metadata_path = get_event_metadata_path(event_id)
-    if not os.path.exists(metadata_path):
-        flash('Event not found', 'error')
-        return redirect(url_for('admin_dashboard'))
+    # Try to get event from MongoDB first
+    event_data = None
+    try:
+        event_data = mongo.get_event(event_id)
+    except Exception as e:
+        print(f"Error retrieving event from MongoDB: {e}")
+    
+    # If MongoDB failed, try file system
+    if not event_data:
+        metadata_path = get_event_metadata_path(event_id)
+        if not os.path.exists(metadata_path):
+            flash('Event not found', 'error')
+            return redirect(url_for('admin_dashboard'))
+        
+        # Load event data from file
+        with open(metadata_path, 'r') as f:
+            event_data = json.load(f)
     
     # Verify ownership
-    with open(metadata_path, 'r') as f:
-        event_data = json.load(f)
-    
     current_username = session.get('admin_username')
     
     if event_data.get('created_by') != current_username:
@@ -655,20 +843,30 @@ def delete_event_route(event_id):
 
 @app.route('/event/<event_id>')
 def public_event_page(event_id):
-    """Public event page for attendees."""
-    metadata_path = get_event_metadata_path(event_id)
-    if not os.path.exists(metadata_path):
-        flash('Event not found', 'error')
-        return redirect(url_for('index'))
+    """Public event page for attendees using MongoDB or file system."""
+    # Try to get event from MongoDB first
+    event_data = None
+    try:
+        event_data = mongo.get_event(event_id)
+    except Exception as e:
+        print(f"Error retrieving event from MongoDB: {e}")
     
-    with open(metadata_path, 'r') as f:
-        event_data = json.load(f)
+    # If MongoDB failed, try file system
+    if not event_data:
+        metadata_path = get_event_metadata_path(event_id)
+        if not os.path.exists(metadata_path):
+            flash('Event not found', 'error')
+            return redirect(url_for('index'))
+        
+        # Load event data from file
+        with open(metadata_path, 'r') as f:
+            event_data = json.load(f)
     
     return render_template('public_event.html', event=event_data, event_id=event_id)
 
 @app.route('/event/<event_id>/match', methods=['POST'])
 def match_face_route(event_id):
-    """Match a face and return matching photos."""
+    """Match a face and return matching photos using MongoDB and file system."""
     if 'face' not in request.files:
         return jsonify({'error': 'No face image provided'}), 400
     
@@ -676,7 +874,60 @@ def match_face_route(event_id):
     if face_file.filename == '':
         return jsonify({'error': 'No face image selected'}), 400
     
-    # Match the face
+    # Try MongoDB first for face matching
+    try:
+        # Read image from the stream
+        face_file.seek(0)
+        image_bytes = face_file.read()
+        face_file.seek(0)  # Reset for potential file-based matching
+        
+        # Load the image
+        image = face_recognition.load_image_file(BytesIO(image_bytes))
+        
+        # Find faces in the uploaded image
+        face_locations = face_recognition.face_locations(image)
+        if face_locations:
+            # Use the first face found
+            face_encodings = face_recognition.face_encodings(image, [face_locations[0]])
+            if face_encodings:
+                face_encoding = face_encodings[0]
+                
+                # Get all face data for this event
+                event_faces = mongo.get_faces_for_event(event_id)
+                
+                # Match against stored faces
+                if event_faces:
+                    # Collect all face encodings to compare
+                    known_face_encodings = []
+                    known_face_data = []
+                    
+                    for face_data in event_faces:
+                        # Convert stored encoding back to numpy array
+                        encoding_bytes = face_data["encoding"]
+                        encoding_shape = face_data["encoding_shape"]
+                        
+                        encoding_np = np.frombuffer(encoding_bytes, dtype=np.float64)
+                        encoding_np = encoding_np.reshape(encoding_shape)
+                        
+                        known_face_encodings.append(encoding_np)
+                        known_face_data.append(face_data)
+                    
+                    # Find matches
+                    matches = face_recognition.compare_faces(known_face_encodings, face_encoding, tolerance=0.6)
+                    
+                    # Get matching photos
+                    matching_photos = set()
+                    for match, face_data in zip(matches, known_face_data):
+                        if match:
+                            # Get the photo filename
+                            matching_photos.add(face_data["photo_filename"])
+                    
+                    if matching_photos:
+                        return jsonify({'message': f'Found {len(matching_photos)} matching photos', 'photos': list(matching_photos)}), 200
+    except Exception as e:
+        print(f"MongoDB face matching error: {e}")
+    
+    # Fallback to file-based matching
     matched_photos = match_face(event_id, face_file)
     
     if not matched_photos:
@@ -687,20 +938,58 @@ def match_face_route(event_id):
 
 @app.route('/event/<event_id>/photo/<filename>')
 def get_event_photo(event_id, filename):
-    """Serve an event photo."""
+    """Serve an event photo from MongoDB or file system."""
     # If user is logged in, check if they have permission to view this photo
     if session.get('admin_logged_in'):
-        metadata_path = get_event_metadata_path(event_id)
-        if os.path.exists(metadata_path):
-            with open(metadata_path, 'r') as f:
-                event_data = json.load(f)
-                
+        # Try MongoDB first
+        try:
+            event_data = mongo.get_event(event_id)
+            if not event_data:
+                # Fallback to file system
+                metadata_path = get_event_metadata_path(event_id)
+                if os.path.exists(metadata_path):
+                    with open(metadata_path, 'r') as f:
+                        event_data = json.load(f)
+            
             current_username = session.get('admin_username')
             
             # Only the creator can access
-            if event_data.get('created_by') != current_username:
+            if event_data and event_data.get('created_by') != current_username:
                 return jsonify({'error': 'Access denied'}), 403
+        except Exception as e:
+            print(f"Error checking permissions: {e}")
+            # Fallback to file check
+            metadata_path = get_event_metadata_path(event_id)
+            if os.path.exists(metadata_path):
+                with open(metadata_path, 'r') as f:
+                    event_data = json.load(f)
+                    
+                current_username = session.get('admin_username')
+                
+                # Only the creator can access
+                if event_data.get('created_by') != current_username:
+                    return jsonify({'error': 'Access denied'}), 403
     
+    # Try to get from MongoDB first
+    try:
+        # Find the photo in GridFS by filename and event_id
+        photo_file = mongo.db.fs.files.find_one({
+            "filename": secure_filename(filename),
+            "metadata.event_id": event_id
+        })
+        
+        if photo_file:
+            # Get the file from GridFS
+            grid_out = mongo.fs.get(photo_file["_id"])
+            return send_file(
+                BytesIO(grid_out.read()),
+                mimetype='image/jpeg'
+            )
+    except Exception as e:
+        print(f"Error retrieving from MongoDB: {e}")
+        # Continue to file fallback
+    
+    # Fallback to file system
     photo_path = os.path.join(get_event_photos_path(event_id), secure_filename(filename))
     if not os.path.exists(photo_path):
         return jsonify({'error': 'Photo not found'}), 404
@@ -731,20 +1020,29 @@ def download_photo(event_id, filename):
 
 @app.route('/admin/event/<event_id>/photo/<filename>/delete', methods=['POST'])
 def delete_photo(event_id, filename):
-    """Delete a specific photo from an event."""
+    """Delete a specific photo from MongoDB and file system."""
     if not session.get('admin_logged_in'):
         return redirect(url_for('admin_login_page'))
     
-    # Check if user has permission to delete photos from this event
-    metadata_path = get_event_metadata_path(event_id)
-    if not os.path.exists(metadata_path):
-        flash('Event not found', 'error')
-        return redirect(url_for('admin_dashboard'))
+    # Try to get event from MongoDB first
+    event_data = None
+    try:
+        event_data = mongo.get_event(event_id)
+    except Exception as e:
+        print(f"Error retrieving event from MongoDB: {e}")
+    
+    # If MongoDB failed, try file system
+    if not event_data:
+        metadata_path = get_event_metadata_path(event_id)
+        if not os.path.exists(metadata_path):
+            flash('Event not found', 'error')
+            return redirect(url_for('admin_dashboard'))
+        
+        # Load event data from file
+        with open(metadata_path, 'r') as f:
+            event_data = json.load(f)
     
     # Verify ownership
-    with open(metadata_path, 'r') as f:
-        event_data = json.load(f)
-    
     current_username = session.get('admin_username')
     
     if event_data.get('created_by') != current_username:
@@ -753,49 +1051,76 @@ def delete_photo(event_id, filename):
     
     # Secure the filename to prevent directory traversal
     secure_filename_str = secure_filename(filename)
+    
+    # Delete from MongoDB first
+    mongo_deleted = False
+    try:
+        # Find the photo in MongoDB by filename and event_id
+        photo_file = mongo.db.fs.files.find_one({
+            "filename": secure_filename_str,
+            "metadata.event_id": event_id
+        })
+        
+        if photo_file:
+            # Delete the photo and its faces from MongoDB
+            photo_id = photo_file["_id"]
+            if mongo.delete_photo(photo_id):
+                mongo_deleted = True
+                print(f"Successfully deleted {filename} from MongoDB")
+    except Exception as e:
+        print(f"Error deleting photo from MongoDB: {e}")
+    
+    # Now try to delete from file system
+    file_deleted = False
     photo_path = os.path.join(get_event_photos_path(event_id), secure_filename_str)
     
-    if not os.path.exists(photo_path):
-        flash('Photo not found', 'error')
-        return redirect(url_for('view_event', event_id=event_id))
+    if os.path.exists(photo_path):
+        try:
+            # Remove the file
+            os.remove(photo_path)
+            file_deleted = True
+            
+            # Also remove related face data
+            faces_data_path = get_event_faces_data_path(event_id)
+            if os.path.exists(faces_data_path):
+                with open(faces_data_path, 'r') as f:
+                    faces_data = json.load(f)
+                
+                # Remove all entries for this photo
+                modified_faces_data = {}
+                for face_id, face_data in faces_data.items():
+                    if face_data.get('photo') != secure_filename_str:
+                        modified_faces_data[face_id] = face_data
+                
+                # Save updated faces data
+                with open(faces_data_path, 'w') as f:
+                    json.dump(modified_faces_data, f)
+                
+                # Remove face images from this photo
+                faces_path = get_event_faces_path(event_id)
+                if os.path.exists(faces_path):
+                    for face_file in os.listdir(faces_path):
+                        if face_file.startswith(f"{secure_filename_str}_"):
+                            face_file_path = os.path.join(faces_path, face_file)
+                            try:
+                                os.remove(face_file_path)
+                            except Exception as e:
+                                print(f"Error removing face file: {str(e)}")
+        except Exception as e:
+            print(f"Error deleting photo from file system: {e}")
     
-    # Remove the photo
-    try:
-        os.remove(photo_path)
-        
-        # Also remove related face data
-        faces_data_path = get_event_faces_data_path(event_id)
-        if os.path.exists(faces_data_path):
-            with open(faces_data_path, 'r') as f:
-                faces_data = json.load(f)
-            
-            # Remove all entries for this photo
-            modified_faces_data = {}
-            for face_id, face_data in faces_data.items():
-                if face_data.get('photo') != secure_filename_str:
-                    modified_faces_data[face_id] = face_data
-            
-            # Save updated faces data
-            with open(faces_data_path, 'w') as f:
-                json.dump(modified_faces_data, f)
-            
-            # Remove face images from this photo
-            faces_path = get_event_faces_path(event_id)
-            if os.path.exists(faces_path):
-                for face_file in os.listdir(faces_path):
-                    if face_file.startswith(f"{secure_filename_str}_"):
-                        face_file_path = os.path.join(faces_path, face_file)
-                        try:
-                            os.remove(face_file_path)
-                        except Exception as e:
-                            app.logger.error(f"Error removing face file: {str(e)}")
-        
+    # Set appropriate message based on whether anything was deleted
+    if mongo_deleted or file_deleted:
         flash('Photo deleted successfully', 'success')
-    except Exception as e:
-        app.logger.error(f"Error deleting photo: {str(e)}")
-        flash(f'Error deleting photo: {str(e)}', 'error')
+    else:
+        flash('Photo not found', 'error')
     
-    return redirect(url_for('view_event', event_id=event_id))
+    # Clear browser cache for this image
+    response = make_response(redirect(url_for('view_event', event_id=event_id)))
+    response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
+    response.headers['Pragma'] = 'no-cache'
+    response.headers['Expires'] = '0'
+    return response
 
 # HTML Templates as strings (for single-file deployment)
 TEMPLATES = {
@@ -5355,12 +5680,11 @@ TEMPLATES = {
                             <input class="form-control" type="file" id="photos" name="photos" multiple accept=".jpg,.jpeg,.png" required onchange="updateFileInfo()">
                             <div class="form-text" id="fileInfo">You can select multiple photos at once.</div>
                         </div>
-                        <div id="progressContainer" style="display:none;" class="mb-3">
-                            <label class="form-label">Upload Progress</label>
-                            <div class="progress" style="height: 25px;">
-                                <div id="uploadProgress" class="progress-bar progress-bar-striped progress-bar-animated" role="progressbar" style="width: 0%"></div>
-                            </div>
-                            <div id="progressStatus" class="form-text mt-2">Preparing files...</div>
+                        <div class="progress mb-3" id="uploadProgress" style="display: none;">
+                            <div class="progress-bar progress-bar-striped progress-bar-animated" id="uploadProgressBar" role="progressbar" aria-valuenow="0" aria-valuemin="0" aria-valuemax="100" style="width: 0%"></div>
+                        </div>
+                        <div id="uploadStatus" class="mb-3" style="display: none;">
+                            <span class="text-primary">Uploading... <span id="uploadPercentage">0%</span></span>
                         </div>
                         <button type="submit" id="uploadBtn" class="btn btn-primary">Upload & Process</button>
                     </form>
@@ -5485,75 +5809,59 @@ TEMPLATES = {
                 }
             }
             
-            // Handle form submission and upload progress with AJAX
+            // Handle file uploads with progress
             document.addEventListener('DOMContentLoaded', function() {
                 const uploadForm = document.getElementById('uploadForm');
                 const uploadBtn = document.getElementById('uploadBtn');
-                const progressContainer = document.getElementById('progressContainer');
+                const progressBar = document.getElementById('uploadProgressBar');
                 const uploadProgress = document.getElementById('uploadProgress');
-                const progressStatus = document.getElementById('progressStatus');
+                const uploadStatus = document.getElementById('uploadStatus');
+                const uploadPercentage = document.getElementById('uploadPercentage');
                 
                 uploadForm.addEventListener('submit', function(e) {
-                    e.preventDefault(); // Prevent the default form submission
+                    e.preventDefault();
                     
-                    const fileInput = document.getElementById('photos');
+                    // Get form data
+                    const formData = new FormData(uploadForm);
                     
-                    if (fileInput.files.length === 0) {
-                        return; // Let the form validation handle this
-                    }
-                    
-                    // Show progress container
-                    progressContainer.style.display = 'block';
-                    uploadBtn.disabled = true;
-                    uploadBtn.innerHTML = '<span class="spinner-border spinner-border-sm me-2" role="status" aria-hidden="true"></span>Uploading...';
-                    
-                    const fileCount = fileInput.files.length;
-                    
-                    // Start with upload message
-                    progressStatus.innerHTML = `Uploading ${fileCount} ${fileCount === 1 ? 'photo' : 'photos'}...`;
-                    
-                    // Create FormData object to send the files
-                    const formData = new FormData();
-                    for (let i = 0; i < fileInput.files.length; i++) {
-                        formData.append('photos', fileInput.files[i]);
-                    }
-                    
-                    // Create and configure XMLHttpRequest
+                    // Create XMLHttpRequest
                     const xhr = new XMLHttpRequest();
                     
-                    // Track upload progress
+                    // Setup progress event
                     xhr.upload.addEventListener('progress', function(e) {
                         if (e.lengthComputable) {
                             const percentComplete = Math.round((e.loaded / e.total) * 100);
-                            uploadProgress.style.width = percentComplete + '%';
-                            uploadProgress.setAttribute('aria-valuenow', percentComplete);
-                            
-                            if (percentComplete === 100) {
-                                progressStatus.innerHTML = 'Processing facial recognition...';
-                            }
+                            progressBar.style.width = percentComplete + '%';
+                            progressBar.setAttribute('aria-valuenow', percentComplete);
+                            uploadPercentage.textContent = percentComplete + '%';
                         }
                     });
                     
-                    // Handle response after upload is complete
-                    xhr.onreadystatechange = function() {
-                        if (xhr.readyState === 4) {
-                            if (xhr.status === 200) {
-                                // Upload successful, refresh the page
-                                window.location.reload();
-                            } else {
-                                // Error handling
-                                progressStatus.innerHTML = 'Error uploading photos. Please try again.';
-                                uploadProgress.classList.remove('bg-primary');
-                                uploadProgress.classList.add('bg-danger');
-                                uploadBtn.disabled = false;
-                                uploadBtn.innerHTML = 'Try Again';
-                            }
+                    // Setup load event
+                    xhr.addEventListener('load', function() {
+                        if (xhr.status === 200) {
+                            // Redirect to the same page to see the uploaded photos
+                            window.location.href = window.location.href;
+                        } else {
+                            uploadStatus.innerHTML = '<span class="text-danger">Upload failed. Please try again.</span>';
+                            uploadBtn.disabled = false;
                         }
-                    };
+                    });
                     
-                    // Set up and send the AJAX request
+                    // Setup error event
+                    xhr.addEventListener('error', function() {
+                        uploadStatus.innerHTML = '<span class="text-danger">Upload failed. Please check your connection.</span>';
+                        uploadBtn.disabled = false;
+                    });
+                    
+                    // Open and send the request
                     xhr.open('POST', uploadForm.action, true);
                     xhr.send(formData);
+                    
+                    // Show progress bar and status
+                    uploadProgress.style.display = 'block';
+                    uploadStatus.style.display = 'block';
+                    uploadBtn.disabled = true;
                 });
             });
         </script>
@@ -5859,7 +6167,11 @@ app.jinja_env.globals.update(render_template=render_template)
 
 # Run the app
 if __name__ == '__main__':
-    if os.environ.get('FLASK_ENV') == 'production':
-        app.run(host='0.0.0.0', debug=False)
+    port = int(os.environ.get('PORT', 5000))
+    env = os.environ.get('FLASK_ENV', 'development')
+    print(f"Running in environment: {env} on port: {port}")
+
+    if env == 'production':
+        app.run(host='0.0.0.0', port=port, debug=False)
     else:
-        app.run(debug=True)
+        app.run(host='0.0.0.0', port=port, debug=True)
