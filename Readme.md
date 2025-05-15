@@ -79,8 +79,8 @@ uploads/
 1. **Clone the repository:**
 
    ```sh
-   git clone <your-repo-url>
-   cd <repo-folder>
+   git clone https://github.com/Shubham-Bhayaje/Event.git
+   cd Event
    ```
 
 2. **Install dependencies:**
