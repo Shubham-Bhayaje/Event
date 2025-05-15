@@ -6,7 +6,7 @@
 
 ### Admin Dashboard
 
-![Admin Dashboard](screenshots/admin_dashboard.png)
+![Admin Dashboard](https://github.com/Shubham-Bhayaje/Event/blob/main/UI/Screenshot%202025-05-15%20090923.png)
 
 ### Event Creation
 
